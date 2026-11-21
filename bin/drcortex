@@ -1,0 +1,771 @@
+#!/usr/bin/env python3
+import os
+import re
+import sys
+import json
+import shutil
+import argparse
+from datetime import datetime
+from pathlib import Path
+
+BASE_DIR = Path.home() / ".drcortex"
+CONFIG_FILE = BASE_DIR / "config.json"
+CORE_TEMPLATE = BASE_DIR / "core" / "master-rules.tpl.md"
+TEMPLATES_DIR = BASE_DIR / "templates"
+
+PLATFORMS = {
+    "1": ("Antigravity IDE", Path.home() / ".gemini" / "antigravity" / "GEMINI.md"),
+    "2": ("Claude Code", Path.home() / ".claude" / "CLAUDE.md"),
+    "3": ("Universal / OpenCode / Codex", Path.home() / ".config" / "drcortex" / "GLOBAL_RULES.md"),
+}
+
+BUILTIN_AGENTS = [
+    ("@Envoy", "Tier 1", "Single point of contact, synthesis, orchestration"),
+    ("@Researcher", "Tier 1", "Deep discovery; asks clarifying questions until zero ambiguity"),
+    ("@Lead", "Tier 1", "Requirements analysis, edge-case resolution, task breakdown"),
+    ("@Architect", "Tier 1", "System design, DB schema/ERD, api-contract.yaml"),
+    ("@Gatekeeper", "Tier 2", "Human-gate auditor; enforces hard stops & exit criteria"),
+    ("@Reviewer", "Tier 1", "Security audit, N+1 detection, type safety, test authoring"),
+    ("@Backend", "Tier 3", "Server-side logic, DB queries, services, background jobs"),
+    ("@Frontend", "Tier 3", "UI components, state management, API contract integration"),
+    ("@Ops", "Tier 4", "Build execution, test runner, Docker/CI, final step reports"),
+]
+
+STACK_POLICIES = {
+    "python-nextjs": """# Development Policy — Full-Stack (Python + Next.js)
+
+## 1. Backend Standards (Python: FastAPI / Django)
+- **Architecture:** Strict 3-layer separation (`Router/API` -> `Service Layer` -> `Repository/ORM`). Zero DB queries inside routers/views.
+- **Typing & Validation:** Mandatory Python Type Hints on all functions. Use Pydantic v2 schemas for all request/response payloads.
+- **Database & Performance:** Prevent N+1 queries (`selectinload`/`joinedload` or `select_related`/`prefetch_related`). Schema changes ONLY via migrations. Use explicit atomic transactions for multi-step writes.
+- **Security:** Never hardcode secrets (use `.env`). Enforce RBAC and object-level ownership checks on every endpoint (prevent IDOR).
+
+## 2. Frontend Standards (Next.js + TypeScript)
+- **Typing:** `strict: true` in `tsconfig.json`. Usage of `any` is strictly forbidden. Sync types with `api-contract.yaml`.
+- **Rendering:** Default to React Server Components (RSC). Add `'use client'` only to interactive leaf components.
+- **Data & State:** Centralize API client calls; handle loading, error, and empty states explicitly.
+
+## 3. Build & Test Commands
+- Backend Tests: `pytest`
+- Frontend Lint & Build: `npm run lint && npm run build`
+""",
+    "python-only": """# Development Policy — Python Backend
+
+## 1. Architecture & Code Quality
+- Strict separation of concerns (`API/Endpoints` -> `Services` -> `Repositories/Models`).
+- Mandatory Type Hints and Pydantic v2 validation.
+- Prevent N+1 queries; use database migrations for all schema updates; wrap critical writes in atomic transactions.
+- Zero hardcoded secrets; strict server-side validation and RBAC checks.
+
+## 2. Build & Test Commands
+- Run Tests: `pytest`
+""",
+    "generic": """# Development Policy — Project Standards
+
+## 1. Core Principles
+- Clean Architecture, SOLID principles, DRY, and KISS.
+- Strict static typing where supported; zero hardcoded credentials.
+- Comprehensive unit/integration testing for every new feature or bugfix.
+"""
+}
+
+SKILL_CATALOG = {
+    "python-backend": {
+        "keywords": ["python", "fastapi", "django", "flask", "pydantic", "sqlalchemy"],
+        "description": "Python backend architecture, strict type hints, Pydantic v2 validation, N+1 prevention, and atomic transactions.",
+        "body": """# Python Backend Skill
+
+## Core Standards
+- Enforce 3-layer separation: `Router/API -> Service -> Repository/ORM`. Never place DB queries inside route handlers.
+- Require Python type hints on all functions and Pydantic v2 schemas for request/response validation.
+- Prevent N+1 queries using eager loading (`selectinload`/`joinedload` or `select_related`/`prefetch_related`).
+- Wrap multi-step database writes in atomic transactions and apply schema changes exclusively via migrations.
+- Never hardcode secrets; enforce server-side RBAC and object ownership checks (IDOR protection).
+""",
+    },
+    "nextjs-frontend": {
+        "keywords": ["next", "nextjs", "next.js", "rsc", "app router"],
+        "description": "Next.js App Router, React Server Components, strict TypeScript, and API contract integration.",
+        "body": """# Next.js Frontend Skill
+
+## Core Standards
+- Use React Server Components (RSC) by default; add `'use client'` only to interactive leaf components.
+- Enforce `strict: true` in `tsconfig.json`; `any` is strictly forbidden.
+- Keep API client types synchronized with `api-contract.yaml` or backend schemas.
+- Explicitly handle loading, error, and empty states in all data-fetching views.
+""",
+    },
+    "pytest-qa": {
+        "keywords": ["pytest", "python", "fastapi", "django", "flask"],
+        "description": "Automated testing with pytest, fixtures, edge-case coverage, and isolation.",
+        "body": """# Pytest QA Skill
+
+## Core Standards
+- Write failing tests before or alongside implementation for every new feature and bugfix.
+- Use isolated fixtures and test databases; never hit production or external paid APIs in unit tests.
+- Cover happy paths, validation errors, authorization boundaries (401/403/404), and edge cases.
+- Run `pytest` to verify all tests pass within the 2-strike build rule.
+""",
+    },
+    "react-frontend": {
+        "keywords": ["react", "vite", "tailwind", "frontend"],
+        "description": "Modular React components, hooks hygiene, strict TypeScript, and accessible UI states.",
+        "body": """# React Frontend Skill
+
+## Core Standards
+- Keep components small, focused, and strictly typed (no `any`).
+- Centralize API calls and server state; avoid duplicated fetch logic inside UI components.
+- Always implement loading, error, and empty UI states.
+""",
+    },
+    "node-typescript": {
+        "keywords": ["node", "nodejs", "typescript", "ts", "express", "nestjs", "fastify", "prisma"],
+        "description": "Node.js & TypeScript backend architecture, schema validation, and safe async error handling.",
+        "body": """# Node.js & TypeScript Skill
+
+## Core Standards
+- Enable `strict: true` in `tsconfig.json` and forbid `any`.
+- Separate controllers/routes from services and data-access layers.
+- Validate all external inputs with Zod/class-validator and handle async errors centrally.
+""",
+    },
+    "go-backend": {
+        "keywords": ["go", "golang", "gin", "fiber", "echo"],
+        "description": "Idiomatic Go backend design, context propagation, explicit error wrapping, and table-driven tests.",
+        "body": """# Go Backend Skill
+
+## Core Standards
+- Keep interfaces small and defined by the consumer; separate handlers, services, and repositories.
+- Propagate `context.Context` through all I/O and database calls.
+- Wrap errors with `%w` (`fmt.Errorf`) and never silently ignore returned errors.
+- Write table-driven tests and verify with `go test ./...`.
+""",
+    },
+    "rust-backend": {
+        "keywords": ["rust", "cargo", "axum", "actix", "tokio"],
+        "description": "Safe idiomatic Rust, explicit Result/Option handling, zero unwrap in production paths, and cargo test.",
+        "body": """# Rust Backend Skill
+
+## Core Standards
+- Avoid `.unwrap()` and `.expect()` in production request paths; propagate errors via `Result` and `?`.
+- Keep async handlers thin and delegate business logic to domain services.
+- Verify with `cargo clippy` and `cargo test`.
+""",
+    },
+    "php-laravel": {
+        "keywords": ["php", "laravel", "eloquent", "symfony"],
+        "description": "Laravel clean architecture, FormRequest validation, eager loading, and Pest/PHPUnit testing.",
+        "body": """# PHP / Laravel Skill
+
+## Core Standards
+- Keep controllers thin; move business logic into Service/Action classes.
+- Validate all inputs via `FormRequest` and enforce authorization via Policies.
+- Prevent N+1 queries with `with()` / `load()` eager loading and modify schema only via migrations.
+""",
+    },
+    "database-sql": {
+        "keywords": ["postgres", "postgresql", "mysql", "sqlite", "sql", "database", "prisma", "orm"],
+        "description": "Relational schema design, migrations, indexing, N+1 prevention, and atomic transactions.",
+        "body": """# Database & SQL Skill
+
+## Core Standards
+- Apply all schema changes exclusively through versioned migrations.
+- Index foreign keys and frequently filtered/sorted columns.
+- Wrap multi-table mutations in atomic database transactions.
+- Audit queries for N+1 patterns and unbounded `SELECT *` fetches.
+""",
+    },
+    "docker-devops": {
+        "keywords": ["docker", "kubernetes", "k8s", "ci", "devops", "compose"],
+        "description": "Multi-stage Dockerfiles, non-root containers, environment hygiene, and CI checks.",
+        "body": """# Docker & DevOps Skill
+
+## Core Standards
+- Use multi-stage builds to keep production images minimal and run containers as a non-root user.
+- Never bake `.env` files or secrets into container images.
+- Define explicit `HEALTHCHECK` and reproducible dependency lockfiles.
+""",
+    },
+    "clean-architecture": {
+        "keywords": ["generic", "clean", "solid"],
+        "description": "Language-agnostic Clean Architecture, SOLID principles, strict typing, and testability.",
+        "body": """# Clean Architecture Skill
+
+## Core Standards
+- Follow SOLID, DRY, and KISS principles with clear boundaries between transport, domain logic, and persistence.
+- Enforce strict static typing where supported and never hardcode secrets.
+- Pair every new feature or bugfix with automated tests.
+""",
+    },
+}
+
+STACK_DEFAULT_SKILLS = {
+    "python-nextjs": ["python-backend", "nextjs-frontend", "pytest-qa"],
+    "python-only": ["python-backend", "pytest-qa"],
+    "generic": ["clean-architecture"],
+}
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "custom"
+
+
+def build_custom_policy(stack_name: str, test_cmd: str = "") -> str:
+    cmd_section = f"- Run Tests / Build: `{test_cmd}`" if test_cmd else "- Document project build and test commands here."
+    return f"""# Development Policy — {stack_name}
+
+## 1. Tech Stack & Architecture
+- **Target Stack:** {stack_name}
+- Enforce strict separation of concerns (`Transport/API` -> `Service Layer` -> `Data/Repository`).
+- Keep functions small, single-purpose, and strictly typed where supported.
+- Never hardcode secrets (use `.env`); validate all inputs and enforce server-side authorization.
+
+## 2. Build & Test Commands
+{cmd_section}
+"""
+
+
+def write_skill_file(skills_dir: Path, slug: str, description: str, body: str, overwrite: bool = True):
+    skill_dir = skills_dir / slug
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    target = skill_dir / "SKILL.md"
+    if not overwrite and target.exists():
+        return
+    content = f"""---
+name: {slug}
+description: {description}
+---
+
+{body.strip()}
+"""
+    target.write_text(content, encoding="utf-8")
+
+
+def match_skills_for_text(query: str) -> list[str]:
+    tokens = set(re.findall(r"[a-z0-9.+]+", query.lower()))
+    matched = []
+    for slug, meta in SKILL_CATALOG.items():
+        if slug in tokens or any(kw in query.lower() for kw in meta["keywords"]):
+            matched.append(slug)
+    return matched
+
+
+def provision_default_skills(project_root: Path, stack: str, custom_stack: str = "", mode: str = "fresh"):
+    skills_dir = project_root / "agent" / "skills"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    overwrite = mode != "coexist"
+
+    # Always install skill-finder
+    sf_src = TEMPLATES_DIR / "agent" / "skills" / "skill-finder" / "SKILL.md"
+    sf_dst = skills_dir / "skill-finder" / "SKILL.md"
+    sf_dst.parent.mkdir(parents=True, exist_ok=True)
+    if sf_src.exists() and (overwrite or not sf_dst.exists()):
+        shutil.copy2(sf_src, sf_dst)
+
+    if stack == "custom":
+        selected = match_skills_for_text(custom_stack)
+        if not selected:
+            custom_slug = slugify(custom_stack)
+            write_skill_file(
+                skills_dir,
+                custom_slug,
+                f"Default domain conventions and quality standards for {custom_stack}.",
+                f"# {custom_stack} Skill\n\n## Core Standards\n- Follow idiomatic best practices for {custom_stack}.\n- Maintain strict separation of concerns, input validation, and automated test coverage.\n",
+                overwrite=overwrite,
+            )
+            selected = ["clean-architecture"]
+    else:
+        selected = STACK_DEFAULT_SKILLS.get(stack, ["clean-architecture"])
+
+    for slug in selected:
+        meta = SKILL_CATALOG[slug]
+        write_skill_file(skills_dir, slug, meta["description"], meta["body"], overwrite=overwrite)
+
+    print(f"🧩 Skills provisioned in agent/skills/: skill-finder, {', '.join(selected)}")
+
+
+def render_global_rules(models: list[str], target_path: Path):
+    t1 = models[0]
+    t2 = models[1] if len(models) > 1 else models[0]
+    t3 = models[2] if len(models) > 2 else t2
+    t4 = models[3] if len(models) > 3 else t3
+
+    content = CORE_TEMPLATE.read_text(encoding="utf-8")
+    content = (
+        content.replace("{{TIER_1}}", t1)
+        .replace("{{TIER_2}}", t2)
+        .replace("{{TIER_3}}", t3)
+        .replace("{{TIER_4}}", t4)
+    )
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(content, encoding="utf-8")
+    print(f"✨ Global rules generated at: {target_path}")
+
+
+def cmd_setup(_args):
+    print("==========================================")
+    print("   🧠 DrCortex — Global Setup Wizard")
+    print("==========================================")
+    print("\nSelect your primary AI coding environment:")
+    for k, (name, path) in PLATFORMS.items():
+        print(f"  [{k}] {name} ({path})")
+    print("  [4] Custom path")
+
+    choice = input("\nEnter choice [1-4] (default 1): ").strip() or "1"
+    if choice in PLATFORMS:
+        platform_name, target_path = PLATFORMS[choice]
+    else:
+        platform_name = "Custom"
+        custom_str = input("Enter full path for global rules file: ").strip()
+        target_path = Path(os.path.expanduser(custom_str))
+
+    print("\n--- Dynamic Model Hierarchy Configuration ---")
+    print("How many AI models do you have access to? (1 to 4)")
+    while True:
+        try:
+            count = int(input("Number of models [1-4] (default 4): ").strip() or "4")
+            if 1 <= count <= 4:
+                break
+        except ValueError:
+            pass
+        print("Please enter a valid number between 1 and 4.")
+
+    print("\nEnter model names from STRONGEST (Flagship) to LIGHTEST (Fast/Eco):")
+    defaults = ["Neon", "Argon", "Hydrogen", "Flash 3.8"]
+    models = []
+    for i in range(count):
+        default_hint = defaults[i] if i < len(defaults) else ""
+        prompt = f"  Model #{i+1} (default: {default_hint}): " if default_hint else f"  Model #{i+1}: "
+        val = input(prompt).strip() or default_hint
+        while not val:
+            val = input(f"  Model #{i+1} cannot be empty: ").strip()
+        models.append(val)
+
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    config = {
+        "platform": platform_name,
+        "global_rules_path": str(target_path),
+        "models": models,
+    }
+    CONFIG_FILE.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    render_global_rules(models, target_path)
+
+    print("\n🎉 DrCortex is configured globally!")
+    print("👉 Navigate to any project root and run: dcx init")
+
+
+def manage_git_tracking(project_root: Path, track: bool):
+    git_dir = project_root / ".git"
+    general_targets = ["AGENT.md", "agent/", "reports/"]
+    always_excluded = ["agent/skills/"]
+    markers = {"# DrCortex local files", "# DrCortex skills (always excluded)"}
+
+    if not git_dir.exists():
+        print("⚠️  No .git directory found. Skipping git exclude configuration.")
+        return
+
+    exclude_file = git_dir / "info" / "exclude"
+    exclude_file.parent.mkdir(parents=True, exist_ok=True)
+    existing = exclude_file.read_text(encoding="utf-8").splitlines() if exclude_file.exists() else []
+
+    cleaned = [
+        line
+        for line in existing
+        if line.strip() not in general_targets
+        and line.strip() not in always_excluded
+        and line.strip() not in markers
+    ]
+
+    if not track:
+        cleaned.append("# DrCortex local files")
+        cleaned.extend(general_targets)
+
+    # agent/skills/ is ALWAYS excluded from Git
+    cleaned.append("# DrCortex skills (always excluded)")
+    cleaned.extend(always_excluded)
+
+    exclude_file.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
+
+    if not track:
+        print("🙈 Git Tracking: OFF (AGENT.md, agent/, reports/, and agent/skills/ hidden via .git/info/exclude)")
+    else:
+        print("👁️  Git Tracking: ON (AGENT.md, agent/, reports/ tracked; agent/skills/ remains excluded)")
+
+
+def detect_existing_setup(project_root: Path) -> list[Path]:
+    candidates = ["AGENT.md", "CLAUDE.md", ".cursorrules", "agent", "reports"]
+    return [project_root / name for name in candidates if (project_root / name).exists()]
+
+
+def backup_legacy_files(project_root: Path, existing_items: list[Path], backup_root: Path) -> str:
+    backup_root.mkdir(parents=True, exist_ok=True)
+    legacy_notes = []
+    for item in existing_items:
+        dest = backup_root / item.name
+        if item.is_dir():
+            shutil.copytree(item, dest, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, dest)
+            if item.name in ("AGENT.md", "CLAUDE.md", ".cursorrules"):
+                legacy_notes.append(f"\n\n---\n## Legacy Rules Imported from `{item.name}`\n\n" + item.read_text(encoding="utf-8"))
+
+    old_policy = project_root / "agent" / "development-policy.md"
+    if old_policy.exists():
+        legacy_notes.append("\n\n---\n## Legacy Development Policy\n\n" + old_policy.read_text(encoding="utf-8"))
+
+    print(f"📦 Legacy backup saved to: {backup_root.relative_to(project_root)}")
+    return "".join(legacy_notes)
+
+
+def cmd_init(args):
+    project_root = Path.cwd()
+    print(f"🧠 Initializing DrCortex in: {project_root}\n")
+
+    existing = detect_existing_setup(project_root)
+    mode = args.mode
+    legacy_appendix = ""
+
+    if existing and not mode:
+        print("⚠️  Existing agent/documentation structure detected:")
+        for item in existing:
+            print(f"   - {item.name}")
+        print("\nHow would you like to proceed?")
+        print("  [1] Migrate & Merge (Backup existing, keep step folders, merge legacy policies)")
+        print("  [2] Coexist (Keep existing files untouched, add missing DrCortex files only)")
+        print("  [3] Fresh Overwrite (Backup existing and install clean DrCortex templates)")
+        m_choice = input("Choice [1-3] (default 1): ").strip() or "1"
+        mode = {"1": "migrate", "2": "coexist", "3": "overwrite"}.get(m_choice, "migrate")
+    elif not existing:
+        mode = "fresh"
+
+    # Select Stack
+    stack = args.stack
+    custom_stack = args.custom_stack or ""
+    custom_test_cmd = ""
+    if not stack:
+        print("\nSelect project tech stack:")
+        print("  [1] Python + Next.js (Full-Stack)")
+        print("  [2] Python Backend Only")
+        print("  [3] Generic / Other")
+        print("  [4] Custom Tech Stack (e.g., Go + React + PostgreSQL)")
+        s_choice = input("Choice [1-4] (default 1): ").strip() or "1"
+        stack = {"1": "python-nextjs", "2": "python-only", "3": "generic", "4": "custom"}.get(s_choice, "python-nextjs")
+
+    if stack == "custom" and not custom_stack:
+        custom_stack = input("Enter your custom tech stack (e.g., Go + React + PostgreSQL): ").strip()
+        while not custom_stack:
+            custom_stack = input("Custom tech stack cannot be empty: ").strip()
+        custom_test_cmd = input("Optional build/test command (e.g., go test ./...): ").strip()
+
+    # Select Git Tracking
+    if args.git is not None:
+        track_git = args.git == "track"
+    else:
+        g_choice = input("\nTrack AGENT.md, agent/ & reports/ in Git? [Y/n] (default Y): ").strip().lower() or "y"
+        track_git = g_choice in ("y", "yes")
+
+    agent_dir = project_root / "agent"
+    internal_dir = agent_dir / ".internal"
+    step_tpl_dir = internal_dir / "step-template"
+    agents_dir = agent_dir / "agents"
+    reports_dir = project_root / "reports"
+
+    if existing and mode in ("migrate", "overwrite"):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_dir = internal_dir / "backup-legacy" / ts
+        legacy_appendix = backup_legacy_files(project_root, existing, backup_dir)
+
+    step_tpl_dir.mkdir(parents=True, exist_ok=True)
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    def write_if_allowed(src: Path, dst: Path):
+        if mode == "coexist" and dst.exists():
+            return
+        shutil.copy2(src, dst)
+
+    write_if_allowed(TEMPLATES_DIR / "AGENT.md", project_root / "AGENT.md")
+    write_if_allowed(TEMPLATES_DIR / "agent" / ".internal" / "BOARD.md", internal_dir / "BOARD.md")
+    write_if_allowed(TEMPLATES_DIR / "agent" / ".internal" / "step-template" / "instructions.md", step_tpl_dir / "instructions.md")
+    write_if_allowed(TEMPLATES_DIR / "agent" / ".internal" / "step-template" / "tasks.md", step_tpl_dir / "tasks.md")
+    write_if_allowed(TEMPLATES_DIR / "reports" / "00-report-template.md", reports_dir / "00-report-template.md")
+
+    policy_file = agent_dir / "development-policy.md"
+    if not (mode == "coexist" and policy_file.exists()):
+        if stack == "custom":
+            policy_content = build_custom_policy(custom_stack, custom_test_cmd)
+        else:
+            policy_content = STACK_POLICIES.get(stack, STACK_POLICIES["generic"])
+        if mode == "migrate" and legacy_appendix:
+            policy_content += legacy_appendix
+        policy_file.write_text(policy_content, encoding="utf-8")
+
+    provision_default_skills(project_root, stack, custom_stack, mode=mode)
+    manage_git_tracking(project_root, track_git)
+
+    print("\n✅ DrCortex initialized cleanly! Root contains only AGENT.md, agent/, and reports/.")
+    print("💬 Open your AI chat and start with: @Envoy let's plan our first feature.")
+
+
+def cmd_git(args):
+    manage_git_tracking(Path.cwd(), args.mode == "track")
+
+
+def cmd_skill(args):
+    project_root = Path.cwd()
+    skills_dir = project_root / "agent" / "skills"
+
+    if args.skill_cmd == "list":
+        if not skills_dir.exists():
+            print("No skills directory found. Run `dcx init` first.")
+            return
+        installed = sorted([p.name for p in skills_dir.iterdir() if p.is_dir() and (p / "SKILL.md").exists()])
+        print("🧩 Installed Project Skills (agent/skills/):")
+        for name in installed:
+            print(f"  - {name}")
+        if not installed:
+            print("  (none)")
+    elif args.skill_cmd == "find":
+        matches = match_skills_for_text(args.query)
+        print(f"🔎 Skill Finder results for '{args.query}':")
+        if matches:
+            for slug in matches:
+                print(f"  - {slug}: {SKILL_CATALOG[slug]['description']}")
+            print("\n👉 Install any match with: dcx skill add <name>")
+        else:
+            print("  No exact built-in match found.")
+            print(f"  👉 Create a custom skill with: dcx skill add {slugify(args.query)}")
+            print("  👉 Or ask @Envoy in chat to discover/synthesize it via agent/skills/skill-finder/SKILL.md")
+    elif args.skill_cmd == "add":
+        if not (project_root / "agent").exists():
+            print("⚠️  Project not initialized. Run `dcx init` first.")
+            return
+        slug = slugify(args.name)
+        if slug in SKILL_CATALOG:
+            meta = SKILL_CATALOG[slug]
+            write_skill_file(skills_dir, slug, meta["description"], meta["body"], overwrite=True)
+        else:
+            desc = args.description or f"Project-specific guidelines and patterns for {args.name}."
+            body = f"# {args.name} Skill\n\n## Core Standards\n- Document key patterns, conventions, and verification commands for {args.name}.\n"
+            write_skill_file(skills_dir, slug, desc, body, overwrite=True)
+        manage_git_tracking(project_root, track=True if _is_git_tracked(project_root) else False)
+        print(f"✅ Skill '{slug}' added at agent/skills/{slug}/SKILL.md (excluded from Git)")
+
+
+def _is_git_tracked(project_root: Path) -> bool:
+    exclude_file = project_root / ".git" / "info" / "exclude"
+    if not exclude_file.exists():
+        return True
+    lines = [l.strip() for l in exclude_file.read_text(encoding="utf-8").splitlines()]
+    return "AGENT.md" not in lines
+
+
+def get_disabled_agents(project_root: Path) -> list[str]:
+    board_file = project_root / "agent" / ".internal" / "BOARD.md"
+    if not board_file.exists():
+        return []
+    for line in board_file.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^\s*-\s*\*\*DISABLED_AGENTS:\*\*\s*`([^`]*)`", line)
+        if m:
+            raw = m.group(1).strip()
+            if not raw or raw.lower() == "none":
+                return []
+            return [a.strip() for a in raw.split(",") if a.strip()]
+    return []
+
+
+def set_disabled_agents(project_root: Path, disabled: list[str]):
+    board_file = project_root / "agent" / ".internal" / "BOARD.md"
+    if not board_file.exists():
+        return
+    formatted = ", ".join(disabled) if disabled else "None"
+    new_line = f"- **DISABLED_AGENTS:** `{formatted}` *(Managed via `dcx agent disable/enable <name>`)*"
+    lines = board_file.read_text(encoding="utf-8").splitlines()
+    replaced = False
+    for idx, line in enumerate(lines):
+        if "**DISABLED_AGENTS:**" in line:
+            lines[idx] = new_line
+            replaced = True
+            break
+    if not replaced:
+        insert_at = next((i + 1 for i, l in enumerate(lines) if "**CURRENT_GATE:**" in l), len(lines))
+        lines.insert(insert_at, new_line)
+    board_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def resolve_agent_handle(project_root: Path, raw_name: str) -> str:
+    target = raw_name.strip().lstrip("@").lower()
+    for name, _, _ in BUILTIN_AGENTS:
+        if name.lstrip("@").lower() == target:
+            return name
+    agents_dir = project_root / "agent" / "agents"
+    if agents_dir.exists():
+        for p in agents_dir.glob("*.md"):
+            if p.stem.lower() == target:
+                return f"@{p.stem}"
+    return f"@{raw_name.strip().lstrip('@')}"
+
+
+def cmd_agent(args):
+    project_root = Path.cwd()
+    agents_dir = project_root / "agent" / "agents"
+    disabled = get_disabled_agents(project_root)
+    disabled_lower = {d.lower() for d in disabled}
+
+    if args.agent_cmd == "list":
+        print("🤖 Built-In 9-Agent Squad:")
+        for name, tier, role in BUILTIN_AGENTS:
+            state = "DISABLED" if name.lower() in disabled_lower else "ENABLED"
+            print(f"  {name:<13} [{tier}] [{state:<8}] — {role}")
+        print("\n🛠️  Project Custom Agents (agent/agents/):")
+        if agents_dir.exists():
+            custom = sorted(agents_dir.glob("*.md"))
+            if custom:
+                for p in custom:
+                    handle = f"@{p.stem}"
+                    state = "DISABLED" if handle.lower() in disabled_lower else "ENABLED"
+                    print(f"  - {handle:<13} [{state:<8}] ({p.relative_to(project_root)})")
+            else:
+                print("  (none)")
+        else:
+            print("  (run `dcx init` first)")
+    elif args.agent_cmd in ("enable", "disable"):
+        if not (project_root / "agent" / ".internal" / "BOARD.md").exists():
+            print("⚠️  Project not initialized. Run `dcx init` first.")
+            return
+        handle = resolve_agent_handle(project_root, args.name)
+        if args.agent_cmd == "disable":
+            if handle.lower() == "@envoy":
+                print("⚠️  `@Envoy` is the default chat interface and cannot be disabled.")
+                return
+            if handle.lower() not in disabled_lower:
+                disabled.append(handle)
+                set_disabled_agents(project_root, disabled)
+            print(f"⏸️  Agent {handle} is now DISABLED (recorded in agent/.internal/BOARD.md).")
+        else:
+            new_disabled = [d for d in disabled if d.lower() != handle.lower()]
+            set_disabled_agents(project_root, new_disabled)
+            print(f"▶️  Agent {handle} is now ENABLED.")
+    elif args.agent_cmd == "add":
+        if not (project_root / "agent").exists():
+            print("⚠️  Project not initialized. Run `dcx init` first.")
+            return
+        name = args.name or input("Custom agent name (e.g., SecurityAuditor or MobileDev): ").strip()
+        while not name:
+            name = input("Agent name cannot be empty: ").strip()
+        clean_name = name.lstrip("@")
+        slug = slugify(clean_name)
+
+        tier = args.tier or (input("Model Tier [1-4] (default 2): ").strip() or "2")
+        if tier not in ("1", "2", "3", "4"):
+            tier = "2"
+
+        role = args.role or input("Role / Responsibilities: ").strip() or f"Specialized engineering tasks for {clean_name}"
+        triggers = args.triggers or input("When should @Envoy invoke this agent? (optional): ").strip() or f"When tasks require {clean_name} expertise"
+
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        agent_file = agents_dir / f"{slug}.md"
+        agent_file.write_text(
+            f"""# Custom Agent: `@{clean_name}`
+
+- **Handle:** `@{clean_name}`
+- **Default Model Tier:** `Tier {tier}` (with standard 4-tier fallback)
+- **Communication Rule:** Internal only — MUST route all outputs, questions, and reports through `@Envoy`.
+
+## Responsibilities
+{role}
+
+## Activation Triggers
+{triggers}
+""",
+            encoding="utf-8",
+        )
+        print(f"✅ Custom agent `@{clean_name}` created at: {agent_file.relative_to(project_root)}")
+        print("💬 `@Envoy` will now automatically discover and orchestrate this agent.")
+
+
+def cmd_status(_args):
+    print("🧠 DrCortex Status")
+    print("-" * 40)
+    if CONFIG_FILE.exists():
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        print(f"Platform     : {cfg.get('platform')}")
+        print(f"Global Rules : {cfg.get('global_rules_path')}")
+        print(f"Model Tiers  : {' > '.join(cfg.get('models', []))}")
+    else:
+        print("Global Setup : Not configured (run `dcx setup`)")
+
+    cwd = Path.cwd()
+    is_init = (cwd / "AGENT.md").exists() and (cwd / "agent").exists()
+    print(f"Local Project: {'Initialized' if is_init else 'Not initialized (run `dcx init`)'}")
+    if is_init:
+        skills_dir = cwd / "agent" / "skills"
+        agents_dir = cwd / "agent" / "agents"
+        s_count = len([p for p in skills_dir.iterdir() if p.is_dir()]) if skills_dir.exists() else 0
+        a_count = len(list(agents_dir.glob("*.md"))) if agents_dir.exists() else 0
+        print(f"Skills       : {s_count} installed (agent/skills/, git-excluded)")
+        disabled = get_disabled_agents(cwd)
+        disabled_info = f", disabled: {', '.join(disabled)}" if disabled else ""
+        print(f"Agents       : 9 built-in + {a_count} custom (agent/agents/{disabled_info})")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="drcortex", description="DrCortex Multi-Agent Framework CLI")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("setup", help="Configure global AI platform and model hierarchy")
+
+    init_p = sub.add_parser("init", help="Initialize DrCortex in the current project")
+    init_p.add_argument("--stack", choices=["python-nextjs", "python-only", "generic", "custom"], help="Project tech stack")
+    init_p.add_argument("--custom-stack", help="Custom tech stack description (used with --stack custom)")
+    init_p.add_argument("--git", choices=["track", "ignore"], help="Git tracking behavior")
+    init_p.add_argument("--mode", choices=["migrate", "coexist", "overwrite"], help="Handling mode for existing agent files")
+
+    git_p = sub.add_parser("git", help="Toggle Git tracking for DrCortex files in current project")
+    git_p.add_argument("mode", choices=["track", "ignore"], help="track or ignore")
+
+    skill_p = sub.add_parser("skill", help="Manage project skills in agent/skills/")
+    skill_sub = skill_p.add_subparsers(dest="skill_cmd", required=True)
+    skill_sub.add_parser("list", help="List installed skills")
+    sf_p = skill_sub.add_parser("find", help="Search Skill Finder catalog")
+    sf_p.add_argument("query", help="Technology or domain keyword")
+    sa_p = skill_sub.add_parser("add", help="Add a skill to agent/skills/")
+    sa_p.add_argument("name", help="Skill name or slug")
+    sa_p.add_argument("--description", help="Short skill description")
+
+    agent_p = sub.add_parser("agent", help="Manage built-in and custom agents")
+    agent_sub = agent_p.add_subparsers(dest="agent_cmd", required=True)
+    agent_sub.add_parser("list", help="List built-in and custom agents with status")
+    aa_p = agent_sub.add_parser("add", help="Add a new custom agent")
+    aa_p.add_argument("--name", help="Agent handle/name (e.g., SecurityAuditor)")
+    aa_p.add_argument("--tier", choices=["1", "2", "3", "4"], help="Default model tier (1-4)")
+    aa_p.add_argument("--role", help="Agent responsibilities")
+    aa_p.add_argument("--triggers", help="When @Envoy should invoke this agent")
+    ae_p = agent_sub.add_parser("enable", help="Enable a disabled agent")
+    ae_p.add_argument("name", help="Agent name (e.g., Gatekeeper or @Gatekeeper)")
+    ad_p = agent_sub.add_parser("disable", help="Disable an agent in BOARD.md")
+    ad_p.add_argument("name", help="Agent name (e.g., Gatekeeper or @Gatekeeper)")
+
+    sub.add_parser("status", help="Show global and local DrCortex configuration status")
+
+    args = parser.parse_args()
+    if args.command == "setup":
+        cmd_setup(args)
+    elif args.command == "init":
+        cmd_init(args)
+    elif args.command == "git":
+        cmd_git(args)
+    elif args.command == "skill":
+        cmd_skill(args)
+    elif args.command == "agent":
+        cmd_agent(args)
+    elif args.command == "status":
+        cmd_status(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
